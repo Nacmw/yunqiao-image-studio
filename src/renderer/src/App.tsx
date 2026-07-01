@@ -7,11 +7,13 @@ import {
   ChevronDown,
   Cloud,
   CloudCog,
+  Clipboard,
   Copy,
   Database,
   Download,
   Eye,
   ExternalLink,
+  FileDown,
   FileSpreadsheet,
   FolderOpen,
   Gauge,
@@ -19,20 +21,24 @@ import {
   ImagePlus,
   LayoutDashboard,
   Lock,
+  Pause,
   Play,
   Plus,
+  Redo2,
   RotateCcw,
   Search,
   SlidersHorizontal,
+  Square,
   Sparkles,
   TestTube2,
   TimerReset,
   Trash2,
+  Undo2,
   UploadCloud,
   WandSparkles,
   X
 } from "lucide-react";
-import type { ComponentType, CSSProperties, ReactNode } from "react";
+import type { ComponentType, CSSProperties, PointerEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 
@@ -120,6 +126,7 @@ type Modal =
   | { kind: "history" }
   | { kind: "asset"; asset: Asset }
   | { kind: "image-preview"; result: GenerationResult }
+  | { kind: "mask-editor"; result: GenerationResult }
   | null;
 
 type ImageSize = ImageSizeValue;
@@ -200,6 +207,7 @@ type BatchTask = {
   error?: string;
   startedAt?: number;
   completedAt?: number;
+  retryCount?: number;
 };
 
 type ImportedImage = {
@@ -212,6 +220,24 @@ type CustomSizeDraft = {
   enabled: boolean;
   width: string;
   height: string;
+};
+
+type ApiDiagnostic = {
+  ok: boolean;
+  status?: number;
+  statusText?: string;
+  endpoint?: string;
+  durationMs?: number;
+  bodyPreview?: string;
+  error?: string;
+  testedAt: number;
+};
+
+type BatchControlStatus = "idle" | "running" | "paused" | "stopping";
+
+type ImageFolderPick = {
+  directory: string;
+  images: Array<{ path: string; name: string }>;
 };
 
 type YunqiaoBridge = {
@@ -228,6 +254,7 @@ type YunqiaoBridge = {
   editImage?: (request: {
     prompt: string;
     imagePaths: string[];
+    maskPath?: string;
     size?: ImageSize;
     quality?: ImageQuality;
     output_format?: ImageFormat;
@@ -235,21 +262,32 @@ type YunqiaoBridge = {
   }) => Promise<{
     data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
   }>;
+  testApi?: () => Promise<Omit<ApiDiagnostic, "testedAt">>;
   getSettings?: () => Promise<{ saveDirectory: string; hasApiKey?: boolean; storageProfiles?: StorageProfile[]; requestTimeoutSeconds?: number; apiBaseUrl?: string }>;
+  checkUpdate?: () => Promise<{ currentVersion: string; latestVersion: string; releaseUrl?: string; publishedAt?: string }>;
   updateSettings?: (patch: Record<string, unknown>) => Promise<{ saveDirectory: string; storageProfiles?: StorageProfile[]; requestTimeoutSeconds?: number; apiBaseUrl?: string }>;
   chooseDirectory?: () => Promise<{ saveDirectory: string } | null>;
   chooseImages?: () => Promise<ImportedImage[]>;
+  chooseImageFolder?: () => Promise<ImageFolderPick | null>;
   openDirectory?: (directory?: string) => Promise<{ ok: boolean; path: string }>;
+  openFileLocation?: (path: string) => Promise<{ ok: boolean; path: string }>;
+  copyImage?: (dataUrl: string) => Promise<{ ok: boolean }>;
   saveImage?: (payload: { dataUrl: string; name: string }) => Promise<{ path: string }>;
+  saveTempImage?: (payload: { dataUrl: string; name: string }) => Promise<{ path: string }>;
   getAssetLibrary?: () => Promise<Asset[]>;
   saveAssetLibrary?: (assets: Asset[]) => Promise<{ ok: boolean }>;
   getCustomTemplates?: () => Promise<Template[]>;
   saveCustomTemplates?: (templates: Template[]) => Promise<{ ok: boolean }>;
+  exportTemplates?: (templates: Template[]) => Promise<{ path: string } | null>;
+  importTemplates?: () => Promise<{ path: string; templates: Template[] } | null>;
   uploadAsset?: (asset: { name: string; project?: string; source?: string; localPath?: string }) => Promise<{ storageName: string; storageType: string; objectKey: string; url: string }>;
   exportUrlList?: (assets: Array<{ name: string; cloudUrl: string }>) => Promise<{ path: string }>;
   createAssetZip?: (assets: Array<{ name: string; prompt: string; cloudUrl: string; localPath?: string }>) => Promise<{ path: string }>;
   importBatchExcel?: () => Promise<{ filePath: string; rows: string[][] } | null>;
+  exportBatchTemplate?: () => Promise<{ path: string }>;
+  exportBatchLog?: (tasks: BatchTask[]) => Promise<{ path: string }>;
   testStorage?: (payload: { type: string; endpoint?: string; host?: string; port?: string }) => Promise<{ ok: boolean; message: string }>;
+  testStorageUpload?: (profile: StorageProfile) => Promise<{ ok: boolean; storageName: string; storageType: string; objectKey: string; url: string; durationMs: number }>;
   openExternal?: (url: string) => Promise<{ ok: boolean; url?: string }>;
 };
 
@@ -1046,9 +1084,31 @@ function makeBatchTask(project: string, industry: string, template: string, coun
   };
 }
 
+function normalizeImportedTemplate(template: Partial<Template>, index: number): Template | null {
+  if (!template.prompt || !template.scene) return null;
+  const sizeValidation = validateGptImage2Size(String(template.size ?? "1024x1536"));
+  return {
+    id: template.id?.startsWith("custom-") ? template.id : `custom-import-${Date.now()}-${index}`,
+    industry: String(template.industry || "导入模板"),
+    scene: String(template.scene),
+    size: sizeValidation.ok ? sizeValidation.value : "1024x1536",
+    quality: (["auto", "low", "medium", "high"].includes(String(template.quality)) ? template.quality : "medium") as ImageQuality,
+    format: (["png", "jpeg", "webp"].includes(String(template.format)) ? template.format : "png") as ImageFormat,
+    prompt: String(template.prompt),
+    avoid: String(template.avoid || "避免文字乱码、水印、主体变形、低清晰度、杂乱背景。"),
+    tags: Array.isArray(template.tags) ? template.tags.map(String).filter(Boolean) : ["导入"],
+    custom: true
+  };
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 function App() {
   const [active, setActive] = useState("工作台");
   const [selectedTemplate, setSelectedTemplate] = useState(templateLibrary[0]);
+  const [currentProject, setCurrentProject] = useState("默认项目");
   const [promptText, setPromptText] = useState(templateLibrary[0].prompt);
   const [avoidText, setAvoidText] = useState(templateLibrary[0].avoid);
   const [variableValues, setVariableValues] = useState<VariableValues>(() => makeVariableValues(templateLibrary[0]));
@@ -1056,6 +1116,7 @@ function App() {
   const [apiKey, setApiKey] = useState("");
   const [apiKeySaved, setApiKeySaved] = useState(false);
   const [apiBaseUrl, setApiBaseUrl] = useState("https://api.0029.org");
+  const [apiDiagnostic, setApiDiagnostic] = useState<ApiDiagnostic | null>(null);
   const [saveDirectory, setSaveDirectory] = useState("");
   const [requestTimeoutSeconds, setRequestTimeoutSeconds] = useState(300);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -1080,6 +1141,7 @@ function App() {
   );
   const [selectedResultId, setSelectedResultId] = useState<string | null>(null);
   const [editSourcePaths, setEditSourcePaths] = useState<string[]>([]);
+  const [retouchMaskPath, setRetouchMaskPath] = useState<string | null>(null);
   const [stageView, setStageView] = useState<StageView>("grid");
   const [selectedRetouchToolId, setSelectedRetouchToolId] = useState(retouchToolPresets[0].id);
   const [storages, setStorages] = useState<StorageProfile[]>([]);
@@ -1089,7 +1151,10 @@ function App() {
   const allTemplates = useMemo(() => [...templateLibrary, ...customTemplates], [customTemplates]);
   const [batchTasks, setBatchTasks] = useState<BatchTask[]>([]);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
+  const [batchControlStatus, setBatchControlStatus] = useState<BatchControlStatus>("idle");
   const [batchSize, setBatchSize] = useState<ImageSize>("1024x1024");
+  const [batchRetryLimit, setBatchRetryLimit] = useState(1);
+  const batchControlRef = useRef<BatchControlStatus>("idle");
 
   const currentHint = useMemo(() => pageHints[active] ?? "管理云桥Pro工作流。", [active]);
   const queuedCount = useMemo(() => batchTasks.filter((task) => task.status === "已导入" || task.status === "生成中").length, [batchTasks]);
@@ -1159,8 +1224,26 @@ function App() {
     });
   }
 
+  async function checkForUpdates() {
+    if (!bridge?.checkUpdate) {
+      notify("当前运行环境不支持检查更新，请到 GitHub Release 页面查看", "warning");
+      return;
+    }
+    try {
+      const result = await bridge.checkUpdate();
+      notify(`当前版本 ${result.currentVersion}，最新版本 ${result.latestVersion}`, result.currentVersion === result.latestVersion ? "info" : "success");
+      if (result.releaseUrl && bridge.openExternal) {
+        await bridge.openExternal(result.releaseUrl);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      notify(`检查更新失败：${message}`, "warning");
+    }
+  }
+
   function useTemplate(template: Template) {
     setSelectedTemplate(template);
+    setCurrentProject((project) => (project === "默认项目" || !project.trim() ? template.industry : project));
     setPromptText(template.prompt);
     setAvoidText(template.avoid);
     setVariableValues((values) => makeVariableValues(template, values));
@@ -1179,6 +1262,32 @@ function App() {
   function copyText(text: string, label: string) {
     void navigator.clipboard?.writeText(text);
     notify(`${label}已复制到剪贴板`);
+  }
+
+  async function copyImageToClipboard(result?: GenerationResult) {
+    if (!result?.dataUrl) {
+      notify("请先选择一张图片", "warning");
+      return;
+    }
+    if (bridge?.copyImage) {
+      await bridge.copyImage(result.dataUrl);
+      notify("图片已复制到系统剪贴板");
+      return;
+    }
+    copyText(result.dataUrl, "图片数据");
+  }
+
+  async function openSelectedFileLocation(result?: GenerationResult) {
+    if (!result?.localPath) {
+      notify("当前结果还没有本地文件路径", "warning");
+      return;
+    }
+    if (!bridge?.openFileLocation) {
+      notify("当前运行环境不支持打开文件位置，请使用桌面客户端", "warning");
+      return;
+    }
+    await bridge.openFileLocation(result.localPath);
+    notify("已在文件管理器中定位图片");
   }
 
   function saveCustomTemplate(template: Template) {
@@ -1205,6 +1314,7 @@ function App() {
 
   function syncTemplateToCreator(template: Template) {
     setSelectedTemplate(template);
+    setCurrentProject((project) => (project === "默认项目" || !project.trim() ? template.industry : project));
     setPromptText(template.prompt);
     setAvoidText(template.avoid);
     setVariableValues((values) => makeVariableValues(template, values));
@@ -1231,7 +1341,7 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
     return {
       id: result.id,
       name: `${selectedTemplate.scene}-${new Date(timestamp).toLocaleTimeString()}`,
-      project: selectedTemplate.industry,
+      project: currentProject.trim() || selectedTemplate.industry,
       source: result.source ?? "文生图",
       cloudUrl: "未上传",
       prompt: `${params.prompt}\n避免内容：${params.avoid}`,
@@ -1305,8 +1415,9 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
         output_format: params.outputFormat,
         background: params.background
       };
+      const maskPath = editingMode && retouchMaskPath ? retouchMaskPath : undefined;
       const response = editingMode
-        ? await imageBridge.editImage!({ ...request, imagePaths: editSourcePaths })
+        ? await imageBridge.editImage!({ ...request, imagePaths: editSourcePaths, maskPath })
         : await imageBridge.generateImage!(request);
       const completedAt = Date.now();
       const responseItems = (response.data ?? []).filter((item) => item.b64_json || item.url);
@@ -1359,6 +1470,7 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
       setSelectedResultId(apiResults[0]?.id ?? null);
       if (editingMode && apiResults[0]?.localPath) {
         setEditSourcePaths([apiResults[0].localPath]);
+        setRetouchMaskPath(null);
       }
       setAssets((items) => [...apiResults.map((result) => makeAssetFromResult(result, params)), ...items]);
       notify(`已生成 ${apiResults.length} 张图片，并写入作品素材库`);
@@ -1432,25 +1544,26 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
     notify("API Key 已保存到本机安全存储");
   }
 
-  async function saveApiBaseUrl() {
-    const nextUrl = apiBaseUrl.trim().replace(/\/+$/, "");
+  async function testApiConnection() {
+    if (!apiKeySaved && !apiKey.trim()) {
+      notify("请先保存 API Key 后再测试接口", "warning");
+      return;
+    }
+    if (!bridge?.testApi) {
+      notify("当前窗口未加载 API 测试桥接，请在桌面客户端中测试", "warning");
+      return;
+    }
+    const testedAt = Date.now();
     try {
-      const parsed = new URL(nextUrl);
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-        throw new Error("API Base URL 仅支持 http 或 https");
-      }
+      const result = await bridge.testApi();
+      const diagnostic: ApiDiagnostic = { ...result, testedAt };
+      setApiDiagnostic(diagnostic);
+      notify(result.ok ? `API 连接正常：HTTP ${result.status}` : `API 返回异常：HTTP ${result.status}`, result.ok ? "success" : "warning");
     } catch (error) {
-      const message = error instanceof Error ? error.message : "API Base URL 格式无效";
-      notify(`API 地址无效：${message}`, "warning");
-      return;
+      const message = error instanceof Error ? error.message : "未知错误";
+      setApiDiagnostic({ ok: false, error: message, endpoint: `${apiBaseUrl}/v1/models`, testedAt });
+      notify(`API 测试失败：${message}`, "warning");
     }
-    if (!bridge?.updateSettings) {
-      notify("当前窗口未加载设置桥接，请在桌面客户端中保存 API 地址", "warning");
-      return;
-    }
-    const settings = await bridge.updateSettings({ apiBaseUrl: nextUrl });
-    setApiBaseUrl(settings.apiBaseUrl ?? nextUrl);
-    notify(`API Base URL 已保存：${settings.apiBaseUrl ?? nextUrl}`);
   }
 
   async function saveRequestTimeout() {
@@ -1784,6 +1897,84 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
     notify(`已从 Excel 导入 ${tasks.length} 条批量任务`);
   }
 
+  async function exportBatchTemplate() {
+    if (!bridge?.exportBatchTemplate) {
+      notify("当前运行环境不支持导出 Excel 模板，请使用桌面客户端", "warning");
+      return;
+    }
+    const result = await bridge.exportBatchTemplate();
+    notify(`批量 Excel 模板已导出：${result.path}`);
+  }
+
+  async function exportBatchLog() {
+    if (!bridge?.exportBatchLog) {
+      notify("当前运行环境不支持导出批量日志，请使用桌面客户端", "warning");
+      return;
+    }
+    const result = await bridge.exportBatchLog(batchTasks);
+    notify(`批量任务日志已导出：${result.path}`);
+  }
+
+  async function bindBatchImageFolder() {
+    if (batchTasks.length === 0) {
+      notify("请先导入或创建批量任务，再绑定底图文件夹", "warning");
+      return;
+    }
+    if (!bridge?.chooseImageFolder) {
+      notify("当前运行环境不支持选择底图文件夹，请使用桌面客户端", "warning");
+      return;
+    }
+    const picked = await bridge.chooseImageFolder();
+    if (!picked || picked.images.length === 0) {
+      notify("文件夹中没有可用图片，支持 png/jpg/jpeg/webp", "warning");
+      return;
+    }
+    setBatchTasks((items) =>
+      items.map((item, index) => {
+        const image = picked.images[index % picked.images.length];
+        return {
+          ...item,
+          imagePath: image.path,
+          imageName: image.name,
+          status: item.status === "失败" ? "已导入" : item.status,
+          error: undefined
+        };
+      })
+    );
+    notify(`已从文件夹绑定 ${picked.images.length} 张底图到批量任务`);
+  }
+
+  async function exportTemplatePack() {
+    if (!bridge?.exportTemplates) {
+      notify("当前运行环境不支持导出模板包，请使用桌面客户端", "warning");
+      return;
+    }
+    const result = await bridge.exportTemplates(customTemplates.length ? customTemplates : allTemplates);
+    if (result?.path) notify(`模板包已导出：${result.path}`);
+  }
+
+  async function importTemplatePack() {
+    if (!bridge?.importTemplates) {
+      notify("当前运行环境不支持导入模板包，请使用桌面客户端", "warning");
+      return;
+    }
+    const result = await bridge.importTemplates();
+    if (!result) return;
+    const imported = result.templates
+      .map((template, index) => normalizeImportedTemplate(template, index))
+      .filter((template): template is Template => Boolean(template));
+    if (imported.length === 0) {
+      notify("模板包中没有可导入的模板", "warning");
+      return;
+    }
+    setCustomTemplates((items) => {
+      const existingIds = new Set(items.map((item) => item.id));
+      const next = imported.map((template) => existingIds.has(template.id) ? { ...template, id: `${template.id}-${Date.now()}` } : template);
+      return [...next, ...items];
+    });
+    notify(`已导入 ${imported.length} 个模板`);
+  }
+
   function addSampleBatchTasks() {
     const samples = [
       makeBatchTask("夏季上新", "电商零售", "商品场景种草图", 2, "为夏季新品生成电商种草场景图，突出清爽、轻量、高质感，适合详情页和小红书封面。"),
@@ -1795,8 +1986,14 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
   }
 
   async function startBatchQueue() {
-    if (isBatchRunning) {
-      notify("批量队列正在运行，请等待当前任务完成", "warning");
+    if (batchControlRef.current === "paused") {
+      batchControlRef.current = "running";
+      setBatchControlStatus("running");
+      notify("批量队列已继续运行", "info");
+      return;
+    }
+    if (isBatchRunning || batchControlRef.current === "running") {
+      notify("批量队列正在运行，可先暂停或停止", "warning");
       return;
     }
     if (batchTasks.length === 0) {
@@ -1833,11 +2030,18 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
     }
 
     setIsBatchRunning(true);
+    batchControlRef.current = "running";
+    setBatchControlStatus("running");
     let successCount = 0;
     let failureCount = 0;
+    const getBatchControlStatus = () => batchControlRef.current as BatchControlStatus;
 
     try {
       for (const task of pendingTasks) {
+        if (getBatchControlStatus() === "stopping") break;
+        while (getBatchControlStatus() === "paused") {
+          await sleep(300);
+        }
         const startedAt = Date.now();
         setBatchTasks((items) =>
           items.map((item) =>
@@ -1851,7 +2055,13 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
         const newAssets: Asset[] = [];
 
         try {
-          for (let index = 0; index < task.count; index += 1) {
+          for (let index = task.completedCount ?? 0; index < task.count; index += 1) {
+            if (getBatchControlStatus() === "stopping") {
+              throw new Error("队列已停止");
+            }
+            while (getBatchControlStatus() === "paused") {
+              await sleep(300);
+            }
             const itemStartedAt = Date.now();
             const request = {
               prompt: task.prompt,
@@ -1865,13 +2075,27 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
               throw new Error(`任务尺寸不符合 gpt-image-2 要求：${taskSizeValidation.message}`);
             }
             request.size = taskSizeValidation.value;
-            const response = task.imagePath
-              ? await batchBridge.editImage!({ ...request, imagePaths: [task.imagePath] })
-              : await batchBridge.generateImage!(request);
-            const first = response.data?.[0];
+            let response: { data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }> } | null = null;
+            let lastError: unknown = null;
+            for (let attempt = 0; attempt <= batchRetryLimit; attempt += 1) {
+              try {
+                response = task.imagePath
+                  ? await batchBridge.editImage!({ ...request, imagePaths: [task.imagePath] })
+                  : await batchBridge.generateImage!(request);
+                break;
+              } catch (error) {
+                lastError = error;
+                if (attempt >= batchRetryLimit) throw error;
+                setBatchTasks((items) =>
+                  items.map((item) => (item.id === task.id ? { ...item, retryCount: attempt + 1, error: `第 ${attempt + 1} 次失败，准备重试` } : item))
+                );
+                await sleep(800);
+              }
+            }
+            const first = response?.data?.[0];
             const dataUrl = first?.b64_json ? `data:image/png;base64,${first.b64_json}` : first?.url;
             if (!dataUrl) {
-              throw new Error("接口没有返回图片数据");
+              throw lastError instanceof Error ? lastError : new Error("接口没有返回图片数据");
             }
 
             const completedAt = Date.now();
@@ -1930,7 +2154,7 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
           setBatchTasks((items) =>
             items.map((item) =>
               item.id === task.id
-                ? { ...item, status: "已完成", completedCount: generatedResults.length, completedAt: Date.now() }
+                ? { ...item, status: "已完成", completedCount: generatedResults.length, retryCount: 0, completedAt: Date.now() }
                 : item
             )
           );
@@ -1946,17 +2170,40 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
           setBatchTasks((items) =>
             items.map((item) =>
               item.id === task.id
-                ? { ...item, status: "失败", completedCount: generatedResults.length, error: message, completedAt: Date.now() }
+                ? { ...item, status: message === "队列已停止" ? "已导入" : "失败", completedCount: generatedResults.length, error: message === "队列已停止" ? undefined : message, completedAt: Date.now() }
                 : item
             )
           );
-          notify(`${task.project} 生成失败：${message}`, "warning");
+          notify(message === "队列已停止" ? "批量队列已停止，未完成任务保留在队列中" : `${task.project} 生成失败：${message}`, "warning");
+          if (message === "队列已停止") break;
         }
       }
-      notify(`批量队列处理完成：成功 ${successCount} 张，失败 ${failureCount} 条`, failureCount ? "warning" : "success");
+      notify(getBatchControlStatus() === "stopping" ? `批量队列已停止：已成功 ${successCount} 张，失败 ${failureCount} 条` : `批量队列处理完成：成功 ${successCount} 张，失败 ${failureCount} 条`, failureCount ? "warning" : "success");
     } finally {
       setIsBatchRunning(false);
+      batchControlRef.current = "idle";
+      setBatchControlStatus("idle");
     }
+  }
+
+  function pauseBatchQueue() {
+    if (batchControlRef.current !== "running") {
+      notify("当前没有正在运行的批量队列", "info");
+      return;
+    }
+    batchControlRef.current = "paused";
+    setBatchControlStatus("paused");
+    notify("批量队列已暂停，当前请求完成后会停在下一步", "info");
+  }
+
+  function stopBatchQueue() {
+    if (batchControlRef.current === "idle") {
+      notify("当前没有正在运行的批量队列", "info");
+      return;
+    }
+    batchControlRef.current = "stopping";
+    setBatchControlStatus("stopping");
+    notify("正在停止批量队列，当前请求完成后停止", "warning");
   }
 
   function applyRetouchTool(toolId: string) {
@@ -2009,6 +2256,9 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
           <button className="quotaButton" onClick={() => setActive("API与云端存储设置")}>
             <Gauge size={16} />
             {apiKeySaved ? "API Key 已保存" : "配置 API Key"}
+          </button>
+          <button className="iconButton" aria-label="检查更新" onClick={checkForUpdates}>
+            <Download size={18} />
           </button>
           <button className="iconButton" aria-label="云同步" onClick={() => notify(storages.length ? "云端同步队列为空" : "请先配置云端存储", storages.length ? "info" : "warning")}>
             <Cloud size={18} />
@@ -2066,6 +2316,8 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
             avoidText={avoidText}
             variableValues={variableValues}
             templates={allTemplates}
+            currentProject={currentProject}
+            onProjectChange={setCurrentProject}
             onTemplateChange={(template) => {
               syncTemplateToCreator(template);
             }}
@@ -2086,9 +2338,24 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
             onStageViewChange={setStageView}
             onContinueEdit={continueSelectedResult}
             onRetouchSelected={retouchSelectedResult}
+            onOpenMaskEditor={() => {
+              const selected = results.find((item) => item.id === selectedResultId && item.dataUrl) ?? results.find((item) => item.dataUrl);
+              if (!selected?.dataUrl) {
+                notify("请先载入或选择一张图片后再绘制遮罩", "warning");
+                return;
+              }
+              setModal({ kind: "mask-editor", result: selected });
+            }}
+            onClearMask={() => {
+              setRetouchMaskPath(null);
+              notify("已清除当前遮罩", "info");
+            }}
+            maskReady={Boolean(retouchMaskPath)}
             onClearEditSource={clearEditSourceImages}
             onSaveImage={saveSelectedImage}
             onUploadSelected={uploadSelectedResult}
+            onCopyImage={() => copyImageToClipboard(results.find((item) => item.id === selectedResultId) ?? results.find((item) => item.dataUrl))}
+            onOpenFileLocation={() => openSelectedFileLocation(results.find((item) => item.id === selectedResultId) ?? results.find((item) => item.localPath))}
             onChooseSourceImage={chooseEditSourceImage}
             onApplyRetouchTool={applyRetouchTool}
             onGenerate={generateImages}
@@ -2100,10 +2367,18 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
             tasks={batchTasks}
             batchSize={batchSize}
             isRunning={isBatchRunning}
+            controlStatus={batchControlStatus}
+            retryLimit={batchRetryLimit}
             onBatchSizeChange={setBatchSize}
+            onRetryLimitChange={setBatchRetryLimit}
             onImport={importBatchExcel}
+            onExportTemplate={exportBatchTemplate}
+            onExportLog={exportBatchLog}
+            onBindFolder={bindBatchImageFolder}
             onCreateSamples={addSampleBatchTasks}
             onStart={startBatchQueue}
+            onPause={pauseBatchQueue}
+            onStop={stopBatchQueue}
             onChooseImage={async (taskId) => {
               if (!bridge?.chooseImages) {
                 notify("当前运行环境不支持选择本地图片，请使用桌面客户端", "warning");
@@ -2155,12 +2430,40 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
             onCopy={copyText}
             onCreate={() => setModal({ kind: "template-editor" })}
             onEdit={(template) => setModal({ kind: "template-editor", template })}
+            onImport={importTemplatePack}
+            onExport={exportTemplatePack}
           />
         ) : active === "作品素材库" ? (
           <AssetPage
             assets={assets}
             onOpenFolder={openSaveDirectory}
             onCopy={copyText}
+            onPreview={(asset) => {
+              if (!asset.previewUrl) {
+                notify("该作品没有可预览图片", "warning");
+                return;
+              }
+              setModal({
+                kind: "image-preview",
+                result: {
+                  id: asset.id,
+                  label: asset.name,
+                  dataUrl: asset.previewUrl,
+                  localPath: asset.localPath,
+                  status: asset.status,
+                  source: asset.source,
+                  prompt: asset.prompt,
+                  upload: asset.cloudUrl && asset.cloudUrl !== "未上传" ? { status: "已上传", url: asset.cloudUrl } : { status: "未上传" }
+                }
+              });
+            }}
+            onOpenLocation={async (asset) => {
+              if (!asset.localPath) {
+                notify("该作品没有本地文件路径", "warning");
+                return;
+              }
+              await openSelectedFileLocation({ id: asset.id, label: asset.name, status: asset.status, localPath: asset.localPath });
+            }}
             onUpload={uploadAsset}
             onBatchExport={exportUrlList}
             onPack={createAssetZip}
@@ -2207,13 +2510,13 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
           <SettingsPage
             apiKey={apiKey}
             apiBaseUrl={apiBaseUrl}
+            apiDiagnostic={apiDiagnostic}
             storages={storages}
             storageDraft={storageDraft}
             saveDirectory={saveDirectory}
             requestTimeoutSeconds={requestTimeoutSeconds}
             onApiKeyChange={setApiKey}
-            onApiBaseUrlChange={setApiBaseUrl}
-            onSaveApiBaseUrl={saveApiBaseUrl}
+            onTestApi={testApiConnection}
             onRequestTimeoutChange={setRequestTimeoutSeconds}
             onSaveApiKey={saveApiKey}
             onSaveRequestTimeout={saveRequestTimeout}
@@ -2243,6 +2546,19 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
               );
               void persistStorages(nextStorages);
               notify(`${profile.name} ${result.message}`, result.ok ? "success" : "warning");
+            }}
+            onTestStorageUpload={async (profile) => {
+              if (!bridge?.testStorageUpload) {
+                notify("当前窗口不支持真实上传测试，请使用桌面客户端", "warning");
+                return;
+              }
+              try {
+                const result = await bridge.testStorageUpload(profile);
+                notify(`上传测试成功：${result.url}`);
+              } catch (error) {
+                const message = error instanceof Error ? error.message : "未知错误";
+                notify(`上传测试失败：${message}`, "warning");
+              }
             }}
             onSetDefault={(profile) => {
               const nextStorages = storages.map((item) => ({ ...item, status: item.id === profile.id ? "默认通道" as const : "连接正常" as const }));
@@ -2275,6 +2591,22 @@ function makeAssetFromResult(result: GenerationResult, params: GenerationParams)
       {modal?.kind === "history" && <HistoryModal assets={assets} results={results} onClose={() => setModal(null)} />}
       {modal?.kind === "asset" && <AssetModal asset={modal.asset} onClose={() => setModal(null)} onCopy={copyText} />}
       {modal?.kind === "image-preview" && <ImagePreviewModal result={modal.result} onClose={() => setModal(null)} onCopy={copyText} />}
+      {modal?.kind === "mask-editor" && (
+        <MaskEditorModal
+          result={modal.result}
+          onClose={() => setModal(null)}
+          onSave={async (maskDataUrl) => {
+            if (!bridge?.saveTempImage) {
+              notify("当前运行环境不支持保存遮罩，请使用桌面客户端", "warning");
+              return;
+            }
+            const saved = await bridge.saveTempImage({ dataUrl: maskDataUrl, name: `${modal.result.label}-mask` });
+            setRetouchMaskPath(saved.path);
+            setModal(null);
+            notify("遮罩已保存，本次修图会优先编辑画笔区域");
+          }}
+        />
+      )}
     </main>
   );
 }
@@ -2396,6 +2728,7 @@ function CreatorPage({
   avoidText,
   variableValues,
   templates,
+  currentProject,
   params,
   results,
   selectedResultId,
@@ -2404,6 +2737,8 @@ function CreatorPage({
   selectedRetouchToolId,
   retouchTools,
   editSourceCount,
+  maskReady,
+  onProjectChange,
   onTemplateChange,
   onPromptChange,
   onAvoidChange,
@@ -2414,9 +2749,13 @@ function CreatorPage({
   onStageViewChange,
   onContinueEdit,
   onRetouchSelected,
+  onOpenMaskEditor,
+  onClearMask,
   onClearEditSource,
   onSaveImage,
   onUploadSelected,
+  onCopyImage,
+  onOpenFileLocation,
   onChooseSourceImage,
   onApplyRetouchTool,
   onGenerate,
@@ -2429,6 +2768,7 @@ function CreatorPage({
   avoidText: string;
   variableValues: VariableValues;
   templates: Template[];
+  currentProject: string;
   params: GenerationParams;
   results: GenerationResult[];
   selectedResultId: string | null;
@@ -2437,6 +2777,8 @@ function CreatorPage({
   selectedRetouchToolId: string;
   retouchTools: RetouchToolPreset[];
   editSourceCount: number;
+  maskReady: boolean;
+  onProjectChange: (value: string) => void;
   onTemplateChange: (template: Template) => void;
   onPromptChange: (value: string) => void;
   onAvoidChange: (value: string) => void;
@@ -2447,9 +2789,13 @@ function CreatorPage({
   onStageViewChange: (view: StageView) => void;
   onContinueEdit: () => void;
   onRetouchSelected: () => void;
+  onOpenMaskEditor: () => void;
+  onClearMask: () => void;
   onClearEditSource: () => void;
   onSaveImage: () => void;
   onUploadSelected: () => void;
+  onCopyImage: () => void;
+  onOpenFileLocation: () => void;
   onChooseSourceImage: () => void;
   onApplyRetouchTool: (toolId: string) => void;
   onGenerate: () => void;
@@ -2486,6 +2832,11 @@ function CreatorPage({
           </div>
           <BadgeCheck size={18} className="goodIcon" />
         </div>
+
+        <label>
+          项目名称
+          <input value={currentProject} onChange={(event) => onProjectChange(event.target.value)} placeholder="例如 店铺名 / 短剧项目 / 客户名称" />
+        </label>
 
         <label>
           行业模板
@@ -2539,6 +2890,16 @@ function CreatorPage({
               </div>
               <button onClick={onClearEditSource} disabled={!editSourceCount}>清空</button>
             </div>
+            <div className="maskToolRow">
+              <button className={maskReady ? "secondaryButton activeSoft" : "secondaryButton"} onClick={onOpenMaskEditor} disabled={!selectedResult?.dataUrl}>
+                <Brush size={15} />
+                {maskReady ? "遮罩已就绪" : "绘制局部遮罩"}
+              </button>
+              <button className="secondaryButton" onClick={onClearMask} disabled={!maskReady}>
+                <Trash2 size={15} />
+                清除遮罩
+              </button>
+            </div>
             <div className="toolShelf">
               {retouchTools.map((tool) => (
                 <button
@@ -2587,16 +2948,14 @@ function CreatorPage({
           <div className="previewActions">
             <button
               className="secondaryButton"
-              onClick={() => {
-                if (!selectedResult?.dataUrl) {
-                  onNotify("请先生成或选择一张图片，上传云端后可复制公网 URL", "warning");
-                  return;
-                }
-                onCopy(selectedResult.dataUrl, "当前图片数据");
-              }}
+              onClick={onCopyImage}
             >
-              <Copy size={15} />
+              <Clipboard size={15} />
               复制图片
+            </button>
+            <button className="secondaryButton" onClick={onOpenFileLocation}>
+              <FolderOpen size={15} />
+              文件位置
             </button>
             <button className="secondaryButton" onClick={onSaveImage}>
               <Download size={15} />
@@ -2959,10 +3318,18 @@ function BatchPage({
   tasks,
   batchSize,
   isRunning,
+  controlStatus,
+  retryLimit,
   onBatchSizeChange,
+  onRetryLimitChange,
   onImport,
+  onExportTemplate,
+  onExportLog,
+  onBindFolder,
   onCreateSamples,
   onStart,
+  onPause,
+  onStop,
   onChooseImage,
   onClearImage,
   onRetryFailed,
@@ -2972,10 +3339,18 @@ function BatchPage({
   tasks: BatchTask[];
   batchSize: ImageSize;
   isRunning: boolean;
+  controlStatus: BatchControlStatus;
+  retryLimit: number;
   onBatchSizeChange: (size: ImageSize) => void;
+  onRetryLimitChange: (value: number) => void;
   onImport: () => void;
+  onExportTemplate: () => void;
+  onExportLog: () => void;
+  onBindFolder: () => void;
   onCreateSamples: () => void;
   onStart: () => void;
+  onPause: () => void;
+  onStop: () => void;
   onChooseImage: (taskId: string) => void;
   onClearImage: (taskId: string) => void;
   onRetryFailed: () => void;
@@ -2992,7 +3367,7 @@ function BatchPage({
     `${task.completedCount ?? 0}/${task.count}`,
     <span className={`taskStatus status-${task.status}`} key={`${task.id}-status`}>{task.status}</span>,
     <div className="tableClip" title={task.error ?? task.prompt} key={`${task.id}-prompt`}>
-      {task.error ? `错误：${task.error}` : task.prompt}
+      {task.error ? `错误：${task.error}` : task.retryCount ? `重试 ${task.retryCount} 次：${task.prompt}` : task.prompt}
     </div>,
     <div className="actionCell" key={`${task.id}-actions`}>
       <button onClick={() => onChooseImage(task.id)} disabled={isRunning}>
@@ -3024,9 +3399,21 @@ function BatchPage({
               <FileSpreadsheet size={16} />
               导入 Excel
             </button>
+            <button className="secondaryButton" onClick={onExportTemplate} disabled={isRunning}>
+              <FileDown size={16} />
+              下载模板
+            </button>
+            <button className="secondaryButton" onClick={onBindFolder} disabled={isRunning || tasks.length === 0}>
+              <FolderOpen size={16} />
+              绑定底图文件夹
+            </button>
             <button className="secondaryButton" onClick={onCreateSamples} disabled={isRunning}>
               <Plus size={16} />
               创建样例任务
+            </button>
+            <button className="secondaryButton" onClick={onExportLog} disabled={tasks.length === 0}>
+              <Download size={16} />
+              导出日志
             </button>
             <button className="secondaryButton" onClick={onRetryFailed} disabled={isRunning || failedCount === 0}>
               <RotateCcw size={16} />
@@ -3040,6 +3427,18 @@ function BatchPage({
               <Play size={16} />
               {isRunning ? "队列运行中" : "开始队列"}
             </button>
+            <button className="secondaryButton" onClick={onPause} disabled={controlStatus !== "running"}>
+              <Pause size={16} />
+              暂停
+            </button>
+            <button className="secondaryButton" onClick={onStart} disabled={controlStatus !== "paused"}>
+              <Play size={16} />
+              继续
+            </button>
+            <button className="secondaryButton" onClick={onStop} disabled={controlStatus === "idle"}>
+              <Square size={16} />
+              停止
+            </button>
           </div>
         </div>
         <div className="batchSummary">
@@ -3047,6 +3446,7 @@ function BatchPage({
           <InfoMetric label="计划图片" value={String(totalRequested)} />
           <InfoMetric label="已完成" value={String(totalCompleted)} />
           <InfoMetric label="失败任务" value={String(failedCount)} tone={failedCount ? "warning" : "success"} />
+          <InfoMetric label="队列状态" value={controlStatus === "idle" ? "空闲" : controlStatus === "running" ? "运行中" : controlStatus === "paused" ? "已暂停" : "停止中"} tone={controlStatus === "stopping" ? "warning" : undefined} />
         </div>
         {rows.length === 0 ? (
           <div className="emptyBox">暂无批量任务。可导入 Excel，或先创建样例任务后再修改提示词方向。</div>
@@ -3060,7 +3460,11 @@ function BatchPage({
           批量输出尺寸
           <ImageSizeControl value={batchSize} onChange={onBatchSizeChange} />
         </label>
-        <InfoList items={["Excel 列顺序：项目、行业、模板、数量、提示词、尺寸（可选）", "每条任务可绑定底图；有底图走图生图，没有底图走文生图", "单条任务最多 10 张，当前按次数逐张生成", "自定义尺寸最高 2K，宽高必须符合 gpt-image-2 规则", "失败任务会保留错误信息，可单独重试"]} />
+        <label className="compactLabel">
+          失败自动重试次数
+          <input type="number" min={0} max={5} value={retryLimit} onChange={(event) => onRetryLimitChange(Math.min(5, Math.max(0, Number(event.target.value) || 0)))} />
+        </label>
+        <InfoList items={["Excel 列顺序：项目、行业、模板、数量、提示词、尺寸（可选）", "每条任务可绑定底图；有底图走图生图，没有底图走文生图", "可从文件夹批量绑定底图，按任务顺序循环分配", "支持暂停、继续、停止和失败自动重试", "自定义尺寸最高 2K，宽高必须符合 gpt-image-2 规则"]} />
       </section>
     </div>
   );
@@ -3072,7 +3476,9 @@ function TemplatePage({
   onPreview,
   onCopy,
   onCreate,
-  onEdit
+  onEdit,
+  onImport,
+  onExport
 }: {
   templates: Template[];
   onUse: (template: Template) => void;
@@ -3080,6 +3486,8 @@ function TemplatePage({
   onCopy: (text: string, label: string) => void;
   onCreate: () => void;
   onEdit: (template: Template) => void;
+  onImport: () => void;
+  onExport: () => void;
 }) {
   const industries = ["全部", ...Array.from(new Set(templates.map((template) => template.industry)))];
   const [industry, setIndustry] = useState("全部");
@@ -3124,6 +3532,14 @@ function TemplatePage({
             <button className="primaryButton" onClick={onCreate}>
               <Plus size={15} />
               新增模板
+            </button>
+            <button className="secondaryButton" onClick={onImport}>
+              <UploadCloud size={15} />
+              导入
+            </button>
+            <button className="secondaryButton" onClick={onExport}>
+              <Download size={15} />
+              导出
             </button>
             <button className={featuredOnly ? "secondaryButton activeSoft" : "secondaryButton"} onClick={() => setFeaturedOnly((value) => !value)}>
               {featuredOnly ? "推荐模板" : "全部模板"}
@@ -3171,6 +3587,8 @@ function AssetPage({
   assets,
   onOpenFolder,
   onCopy,
+  onPreview,
+  onOpenLocation,
   onUpload,
   onBatchExport,
   onPack,
@@ -3181,6 +3599,8 @@ function AssetPage({
   assets: Asset[];
   onOpenFolder: () => void;
   onCopy: (text: string, label: string) => void;
+  onPreview: (asset: Asset) => void;
+  onOpenLocation: (asset: Asset) => void;
   onUpload: (asset: Asset) => void;
   onBatchExport: () => void;
   onPack: () => void;
@@ -3188,6 +3608,19 @@ function AssetPage({
   onRetouch: (asset: Asset) => void;
   onDetail: (asset: Asset) => void;
 }) {
+  const [query, setQuery] = useState("");
+  const [project, setProject] = useState("全部");
+  const [cloudState, setCloudState] = useState("全部");
+  const projects = ["全部", ...Array.from(new Set(assets.map((asset) => asset.project).filter(Boolean)))];
+  const filteredAssets = assets.filter((asset) => {
+    const text = `${asset.name} ${asset.project} ${asset.source} ${asset.prompt} ${asset.cloudUrl}`.toLowerCase();
+    const hitQuery = !query.trim() || text.includes(query.trim().toLowerCase());
+    const hitProject = project === "全部" || asset.project === project;
+    const uploaded = asset.cloudUrl && asset.cloudUrl !== "未上传";
+    const hitCloud = cloudState === "全部" || (cloudState === "已上传" ? uploaded : !uploaded);
+    return hitQuery && hitProject && hitCloud;
+  });
+
   return (
     <section className="panel">
       <div className="panelHeader">
@@ -3210,24 +3643,41 @@ function AssetPage({
           </button>
         </div>
       </div>
+      <div className="assetFilters">
+        <div className="globalSearch localSearch">
+          <Search size={16} />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索作品、项目、提示词、URL" />
+        </div>
+        <select value={project} onChange={(event) => setProject(event.target.value)}>
+          {projects.map((item) => <option value={item} key={item}>{item}</option>)}
+        </select>
+        <select value={cloudState} onChange={(event) => setCloudState(event.target.value)}>
+          <option>全部</option>
+          <option>已上传</option>
+          <option>未上传</option>
+        </select>
+        <span>{filteredAssets.length} / {assets.length}</span>
+      </div>
       {assets.length === 0 ? (
         <div className="emptyBox">暂无作品。完成文生图、图生图或批量生产后，作品会自动进入素材库。</div>
       ) : (
         <DataTable
           className="assetTable"
           columns={["预览", "作品", "项目", "来源", "云端 URL", "操作"]}
-          rows={assets.map((asset) => [
-            <div className="assetThumb" key={`${asset.id}-thumb`}>
+          rows={filteredAssets.map((asset) => [
+            <button className="assetThumb" key={`${asset.id}-thumb`} onClick={() => onPreview(asset)}>
               {asset.previewUrl ? <img src={asset.previewUrl} alt={asset.name} /> : <ImagePlus size={18} />}
-            </div>,
+            </button>,
             asset.name,
             asset.project,
             asset.source,
             asset.cloudUrl,
             <div className="actionCell" key={asset.id}>
+              <button onClick={() => onPreview(asset)}>预览</button>
               <button onClick={() => onDetail(asset)}>详情</button>
               <button onClick={() => onCopy(asset.prompt, "作品提示词")}>复制词</button>
               <button onClick={() => onUpload(asset)}>上传</button>
+              <button onClick={() => onOpenLocation(asset)}>位置</button>
               <button onClick={() => onEdit(asset)}>继续编辑</button>
               <button onClick={() => onRetouch(asset)}>修图</button>
             </div>
@@ -3241,13 +3691,13 @@ function AssetPage({
 function SettingsPage({
   apiKey,
   apiBaseUrl,
+  apiDiagnostic,
   storages,
   storageDraft,
   saveDirectory,
   requestTimeoutSeconds,
   onApiKeyChange,
-  onApiBaseUrlChange,
-  onSaveApiBaseUrl,
+  onTestApi,
   onRequestTimeoutChange,
   onSaveApiKey,
   onSaveRequestTimeout,
@@ -3258,17 +3708,18 @@ function SettingsPage({
   onAddStorage,
   onTestDraft,
   onTestStorage,
+  onTestStorageUpload,
   onSetDefault
 }: {
   apiKey: string;
   apiBaseUrl: string;
+  apiDiagnostic: ApiDiagnostic | null;
   storages: StorageProfile[];
   storageDraft: StorageDraft;
   saveDirectory: string;
   requestTimeoutSeconds: number;
   onApiKeyChange: (value: string) => void;
-  onApiBaseUrlChange: (value: string) => void;
-  onSaveApiBaseUrl: () => void;
+  onTestApi: () => void;
   onRequestTimeoutChange: (value: number) => void;
   onSaveApiKey: () => void;
   onSaveRequestTimeout: () => void;
@@ -3279,6 +3730,7 @@ function SettingsPage({
   onAddStorage: () => void;
   onTestDraft: () => void;
   onTestStorage: (profile: StorageProfile) => void;
+  onTestStorageUpload: (profile: StorageProfile) => void;
   onSetDefault: (profile: StorageProfile) => void;
 }) {
   const isFtp = storageDraft.type === "FTP" || storageDraft.type === "SFTP";
@@ -3292,26 +3744,35 @@ function SettingsPage({
         <div className="panelHeader">
           <div>
             <h2>API 设置</h2>
-            <p>可自定义兼容 OpenAI 图片接口的服务地址。默认可到 0029.org 购买套餐并生成秘钥；Key 只保存在本机安全存储中。</p>
+            <p>服务地址固定为 0029.org。请先到 0029.org 购买套餐并生成秘钥；Key 只保存在本机安全存储中。</p>
           </div>
           <Database size={18} />
         </div>
         <label>
-          API Base URL
-          <input value={apiBaseUrl} onChange={(event) => onApiBaseUrlChange(event.target.value)} placeholder="例如 https://api.0029.org" />
+          固定 API Base URL
+          <input value={apiBaseUrl} readOnly />
         </label>
-        <button className="secondaryButton" onClick={onSaveApiBaseUrl}>
-          <CloudCog size={16} />
-          保存 API 地址
-        </button>
         <label>
           API Key
           <input type="password" value={apiKey} onChange={(event) => onApiKeyChange(event.target.value)} placeholder="输入测试或客户专属 Key" />
         </label>
-        <button className="primaryButton" onClick={onSaveApiKey}>
-          <TestTube2 size={16} />
-          保存 API Key
-        </button>
+        <div className="buttonRow">
+          <button className="primaryButton" onClick={onSaveApiKey}>
+            <TestTube2 size={16} />
+            保存 API Key
+          </button>
+          <button className="secondaryButton" onClick={onTestApi}>
+            <CloudCog size={16} />
+            测试 API
+          </button>
+        </div>
+        {apiDiagnostic && (
+          <div className={`diagnosticBox ${apiDiagnostic.ok ? "success" : "warning"}`}>
+            <strong>{apiDiagnostic.ok ? "API 连接正常" : "API 连接异常"}</strong>
+            <span>{apiDiagnostic.endpoint ?? apiBaseUrl} · {apiDiagnostic.status ? `HTTP ${apiDiagnostic.status}` : "无状态码"} · {formatDuration(apiDiagnostic.durationMs)} · {formatTime(apiDiagnostic.testedAt)}</span>
+            <code>{apiDiagnostic.error ?? apiDiagnostic.bodyPreview ?? apiDiagnostic.statusText ?? "无返回详情"}</code>
+          </div>
+        )}
         <label>
           请求超时时间（秒）
           <input
@@ -3477,6 +3938,7 @@ function SettingsPage({
                 <em>{profile.status} · {profile.autoUpload ? "自动上传" : "手动上传"}</em>
                 <div className="buttonRow">
                   <button onClick={() => onTestStorage(profile)}>测试</button>
+                  <button onClick={() => onTestStorageUpload(profile)}>上传测试</button>
                   <button onClick={() => onSetDefault(profile)}>默认</button>
                 </div>
               </div>
@@ -3677,6 +4139,173 @@ function ImagePreviewModal({ result, onClose, onCopy }: { result: GenerationResu
       <div className="modalActions">
         {result.dataUrl && <button className="secondaryButton" onClick={() => onCopy(result.dataUrl!, "当前图片数据")}>复制图片</button>}
         <button className="primaryButton" onClick={onClose}>完成</button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function MaskEditorModal({
+  result,
+  onClose,
+  onSave
+}: {
+  result: GenerationResult;
+  onClose: () => void;
+  onSave: (maskDataUrl: string) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imageRef = useRef<HTMLImageElement | null>(null);
+  const [brushSize, setBrushSize] = useState(56);
+  const [drawing, setDrawing] = useState(false);
+  const [history, setHistory] = useState<ImageData[]>([]);
+  const [redoStack, setRedoStack] = useState<ImageData[]>([]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !result.dataUrl) return;
+    const image = new Image();
+    image.onload = () => {
+      const maxWidth = 920;
+      const scale = Math.min(1, maxWidth / image.naturalWidth);
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+      const context = canvas.getContext("2d");
+      if (!context) return;
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      context.fillStyle = "rgba(0,0,0,0)";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      imageRef.current = image;
+      setHistory([context.getImageData(0, 0, canvas.width, canvas.height)]);
+      setRedoStack([]);
+    };
+    image.src = result.dataUrl;
+  }, [result.dataUrl]);
+
+  function point(event: PointerEvent<HTMLCanvasElement>) {
+    const canvas = canvasRef.current!;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: ((event.clientX - rect.left) / rect.width) * canvas.width,
+      y: ((event.clientY - rect.top) / rect.height) * canvas.height
+    };
+  }
+
+  function pushHistory() {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    const snapshot = context.getImageData(0, 0, canvas.width, canvas.height);
+    setHistory((items) => [...items.slice(-19), snapshot]);
+    setRedoStack([]);
+  }
+
+  function drawAt(x: number, y: number) {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    context.save();
+    context.globalCompositeOperation = "source-over";
+    context.fillStyle = "rgba(255,255,255,1)";
+    context.beginPath();
+    context.arc(x, y, brushSize / 2, 0, Math.PI * 2);
+    context.fill();
+    context.restore();
+  }
+
+  function restore(snapshot?: ImageData) {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context || !snapshot) return;
+    context.putImageData(snapshot, 0, 0);
+  }
+
+  function undo() {
+    setHistory((items) => {
+      if (items.length <= 1) return items;
+      const canvas = canvasRef.current;
+      const context = canvas?.getContext("2d");
+      if (canvas && context) {
+        const current = context.getImageData(0, 0, canvas.width, canvas.height);
+        setRedoStack((redo) => [current, ...redo]);
+      }
+      const next = items.slice(0, -1);
+      restore(next[next.length - 1]);
+      return next;
+    });
+  }
+
+  function redo() {
+    setRedoStack((items) => {
+      const [first, ...rest] = items;
+      if (!first) return items;
+      restore(first);
+      setHistory((historyItems) => [...historyItems, first]);
+      return rest;
+    });
+  }
+
+  function clearMask() {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    pushHistory();
+  }
+
+  function saveMask() {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    onSave(canvas.toDataURL("image/png"));
+  }
+
+  return (
+    <ModalShell title="局部遮罩编辑" onClose={onClose} className="maskEditorPanel">
+      <div className="maskToolbar">
+        <label>
+          画笔大小
+          <input type="range" min={12} max={160} value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} />
+        </label>
+        <div className="buttonRow">
+          <button className="secondaryButton" onClick={undo} disabled={history.length <= 1}>
+            <Undo2 size={15} />
+            撤销
+          </button>
+          <button className="secondaryButton" onClick={redo} disabled={redoStack.length === 0}>
+            <Redo2 size={15} />
+            重做
+          </button>
+          <button className="secondaryButton" onClick={clearMask}>
+            <Trash2 size={15} />
+            清空
+          </button>
+        </div>
+      </div>
+      <div className="maskCanvasWrap">
+        {result.dataUrl && <img src={result.dataUrl} alt={result.label} />}
+        <canvas
+          ref={canvasRef}
+          onPointerDown={(event) => {
+            event.currentTarget.setPointerCapture(event.pointerId);
+            pushHistory();
+            setDrawing(true);
+            const next = point(event);
+            drawAt(next.x, next.y);
+          }}
+          onPointerMove={(event) => {
+            if (!drawing) return;
+            const next = point(event);
+            drawAt(next.x, next.y);
+          }}
+          onPointerUp={() => setDrawing(false)}
+          onPointerLeave={() => setDrawing(false)}
+        />
+      </div>
+      <div className="modalActions">
+        <button className="secondaryButton" onClick={onClose}>取消</button>
+        <button className="primaryButton" onClick={saveMask}>
+          <Brush size={15} />
+          使用遮罩
+        </button>
       </div>
     </ModalShell>
   );

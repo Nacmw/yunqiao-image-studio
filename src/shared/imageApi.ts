@@ -26,7 +26,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs?: numb
   }
 }
 
-function cleanGenerationBody(request: ImageGenerationRequest) {
+export function buildImageRequestBodyForTest(request: ImageGenerationRequest) {
   const body: Record<string, unknown> = {
     model: IMAGE_MODEL,
     prompt: request.prompt,
@@ -49,6 +49,10 @@ function cleanGenerationBody(request: ImageGenerationRequest) {
   }
 
   return body;
+}
+
+function cleanGenerationBody(request: ImageGenerationRequest) {
+  return buildImageRequestBodyForTest(request);
 }
 
 async function parseImageResponse(response: Response): Promise<ImageApiResult> {

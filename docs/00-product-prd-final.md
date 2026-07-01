@@ -3,7 +3,7 @@
 版本: v1.0  
 日期: 2026-06-28  
 模型: `gpt-image-2`  
-默认 API Base URL: `https://api.0029.org`，可在设置页自定义兼容 OpenAI 图片接口的服务地址
+固定 API Base URL: `https://api.0029.org`
 
 ## 1. 产品定位
 
@@ -469,7 +469,7 @@ API Base URL 默认值:
 https://api.0029.org
 ```
 
-用户可在设置页改为其他兼容 OpenAI 图片接口的服务地址。
+客户端固定使用 `https://api.0029.org`，设置页不提供自定义 API 地址入口。
 
 密钥处理:
 
@@ -523,7 +523,7 @@ https://api.0029.org
 基础生成:
 
 - 用户能配置 API Key。
-- 用户能使用默认或自定义 API Base URL 发起生图请求。
+- 用户能使用固定 API Base URL `https://api.0029.org` 发起生图请求。
 - 单次默认生成 1 张图片；多图数量参数暂不传递，避免中转接口和官方接口返回 `tools[0].n` 错误。
 - 图片能保存到本地作品库。
 

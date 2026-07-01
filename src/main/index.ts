@@ -1,5 +1,5 @@
-import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from "electron";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, safeStorage, shell } from "electron";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
@@ -17,6 +17,8 @@ import type { ImageEditRequest, ImageGenerationRequest } from "../shared/imageAp
 
 let mainWindow: BrowserWindow | null = null;
 let encryptedApiKey: Buffer | null = null;
+const FIXED_API_BASE_URL = "https://api.0029.org";
+const SUPPORTED_IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 
 type PersistedStorageProfile = {
   id: string;
@@ -56,7 +58,7 @@ function defaultSettings(): AppSettings {
     saveDirectory: path.join(app.getPath("pictures"), "云桥Pro"),
     storageProfiles: [],
     requestTimeoutSeconds: 300,
-    apiBaseUrl: "https://api.0029.org"
+    apiBaseUrl: FIXED_API_BASE_URL
   };
 }
 
@@ -66,14 +68,8 @@ function clampRequestTimeoutSeconds(value: unknown) {
   return Math.min(600, Math.max(1, Math.round(numeric)));
 }
 
-function normalizeApiBaseUrl(value: unknown) {
-  const raw = String(value || "").trim();
-  if (!raw) return defaultSettings().apiBaseUrl;
-  const parsed = new URL(raw);
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error("API Base URL 仅支持 http 或 https");
-  }
-  return parsed.toString().replace(/\/+$/, "");
+function normalizeApiBaseUrl(_value?: unknown) {
+  return FIXED_API_BASE_URL;
 }
 
 function settingsPath() {
@@ -111,9 +107,10 @@ async function readSettings(): Promise<AppSettings> {
 }
 
 async function writeSettings(patch: Partial<AppSettings>) {
-  const settings = { ...(await readSettings()), ...patch };
+  const { apiBaseUrl: _apiBaseUrl, ...safePatch } = patch;
+  const settings = { ...(await readSettings()), ...safePatch, apiBaseUrl: FIXED_API_BASE_URL };
   settings.requestTimeoutSeconds = clampRequestTimeoutSeconds(settings.requestTimeoutSeconds);
-  settings.apiBaseUrl = normalizeApiBaseUrl(settings.apiBaseUrl);
+  settings.apiBaseUrl = FIXED_API_BASE_URL;
   await mkdir(app.getPath("userData"), { recursive: true });
   await writeFile(settingsPath(), JSON.stringify(settings, null, 2), "utf-8");
   return settings;
@@ -248,6 +245,26 @@ function mimeFromPath(filePath: string) {
   if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
   if (ext === ".webp") return "image/webp";
   return "image/png";
+}
+
+async function readImageFile(filePath: string) {
+  const data = await readFile(filePath);
+  return {
+    path: filePath,
+    name: path.basename(filePath),
+    dataUrl: `data:${mimeFromPath(filePath)};base64,${data.toString("base64")}`
+  };
+}
+
+async function listImagesInDirectory(directory: string) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isFile() && SUPPORTED_IMAGE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()))
+    .map((entry) => ({
+      path: path.join(directory, entry.name),
+      name: entry.name
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN"));
 }
 
 function crc32(buffer: Buffer) {
@@ -549,6 +566,42 @@ async function testHttpEndpoint(endpoint: string) {
   }
 }
 
+async function testApiConnection(timeoutSeconds: number) {
+  const startedAt = Date.now();
+  const url = `${FIXED_API_BASE_URL}/v1/models`;
+  const response = await fetchWithTimeoutForMain(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${await getApiKey()}`,
+      Accept: "application/json"
+    }
+  }, timeoutSeconds * 1000);
+  const text = await response.text();
+  return {
+    ok: response.ok,
+    status: response.status,
+    statusText: response.statusText,
+    endpoint: url,
+    durationMs: Date.now() - startedAt,
+    bodyPreview: text.slice(0, 800)
+  };
+}
+
+async function fetchWithTimeoutForMain(url: string, init: RequestInit, timeoutMs: number) {
+  const controller = new AbortController();
+  const timer = windowlessTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -604,7 +657,37 @@ ipcMain.handle("app:get-settings", async () => ({
   hasApiKey: await hasSavedApiKey()
 }));
 
+ipcMain.handle("app:check-update", async () => {
+  const response = await fetchWithTimeoutForMain("https://api.github.com/repos/jxb412/YunQiao-Image-Studio/releases/latest", {
+    method: "GET",
+    headers: {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "YunQiao-Image-Studio"
+    }
+  }, 12000);
+  if (!response.ok) {
+    throw new Error(`检查更新失败：HTTP ${response.status}`);
+  }
+  const latest = await response.json() as {
+    tag_name?: string;
+    name?: string;
+    html_url?: string;
+    published_at?: string;
+  };
+  return {
+    currentVersion: app.getVersion(),
+    latestVersion: latest.tag_name?.replace(/^v/i, "") || latest.name || "未知版本",
+    releaseUrl: latest.html_url,
+    publishedAt: latest.published_at
+  };
+});
+
 ipcMain.handle("settings:update", async (_event, patch: Partial<AppSettings>) => writeSettingsSecure(patch));
+
+ipcMain.handle("api:test", async () => {
+  const settings = await readSettings();
+  return testApiConnection(settings.requestTimeoutSeconds);
+});
 
 ipcMain.handle("dialog:choose-directory", async () => {
   if (!mainWindow) throw new Error("主窗口未就绪");
@@ -626,16 +709,21 @@ ipcMain.handle("dialog:choose-images", async () => {
     ]
   });
   if (result.canceled || result.filePaths.length === 0) return [];
-  return Promise.all(
-    result.filePaths.map(async (filePath) => {
-      const data = await readFile(filePath);
-      return {
-        path: filePath,
-        name: path.basename(filePath),
-        dataUrl: `data:${mimeFromPath(filePath)};base64,${data.toString("base64")}`
-      };
-    })
-  );
+  return Promise.all(result.filePaths.map(readImageFile));
+});
+
+ipcMain.handle("dialog:choose-image-folder", async () => {
+  if (!mainWindow) throw new Error("主窗口未就绪");
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ["openDirectory"],
+    title: "选择批量图生图底图文件夹"
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  const directory = result.filePaths[0];
+  return {
+    directory,
+    images: await listImagesInDirectory(directory)
+  };
 });
 
 ipcMain.handle("file:open-directory", async (_event, directory?: string) => {
@@ -646,12 +734,35 @@ ipcMain.handle("file:open-directory", async (_event, directory?: string) => {
   return { ok: true, path: target };
 });
 
+ipcMain.handle("file:open-location", async (_event, filePath: string) => {
+  if (!filePath) throw new Error("文件路径为空");
+  shell.showItemInFolder(filePath);
+  return { ok: true, path: filePath };
+});
+
+ipcMain.handle("clipboard:copy-image", async (_event, dataUrl: string) => {
+  const image = nativeImage.createFromDataURL(dataUrl);
+  if (image.isEmpty()) throw new Error("图片数据无效，无法复制到剪贴板");
+  clipboard.writeImage(image);
+  return { ok: true };
+});
+
 ipcMain.handle("assets:save-image", async (_event, payload: { dataUrl: string; name: string }) => {
   const settings = await readSettings();
   await mkdir(settings.saveDirectory, { recursive: true });
   const image = await readImagePayload(payload.dataUrl);
   const filename = `${sanitizeName(payload.name)}-${Date.now()}.${image.ext}`;
   const filePath = path.join(settings.saveDirectory, filename);
+  await writeFile(filePath, image.data);
+  return { path: filePath };
+});
+
+ipcMain.handle("assets:save-temp-image", async (_event, payload: { dataUrl: string; name: string }) => {
+  const directory = path.join(app.getPath("userData"), "temp-images");
+  await mkdir(directory, { recursive: true });
+  const image = await readImagePayload(payload.dataUrl);
+  const filename = `${sanitizeName(payload.name)}-${Date.now()}.${image.ext}`;
+  const filePath = path.join(directory, filename);
   await writeFile(filePath, image.data);
   return { path: filePath };
 });
@@ -693,6 +804,90 @@ ipcMain.handle("assets:export-url-list", async (_event, assets: Array<{ name: st
   return { path: filePath };
 });
 
+ipcMain.handle("batch:export-log", async (_event, tasks: Array<{ project: string; industry: string; template: string; count: number; completedCount?: number; status: string; prompt: string; error?: string; imageName?: string; size?: string }>) => {
+  const settings = await readSettings();
+  await mkdir(settings.saveDirectory, { recursive: true });
+  const rows = [
+    ["项目", "行业", "模板", "模式/底图", "数量", "已完成", "状态", "尺寸", "提示词", "错误"].join("\t"),
+    ...tasks.map((task) => [
+      task.project,
+      task.industry,
+      task.template,
+      task.imageName ? `图生图:${task.imageName}` : "文生图",
+      String(task.count),
+      String(task.completedCount ?? 0),
+      task.status,
+      task.size || "",
+      task.prompt,
+      task.error || ""
+    ].join("\t"))
+  ];
+  const filePath = path.join(settings.saveDirectory, `云桥Pro-批量任务日志-${Date.now()}.tsv`);
+  await writeFile(filePath, rows.join("\n"), "utf-8");
+  return { path: filePath };
+});
+
+ipcMain.handle("batch:export-template", async () => {
+  const settings = await readSettings();
+  await mkdir(settings.saveDirectory, { recursive: true });
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet("批量生产模板");
+  worksheet.columns = [
+    { header: "项目", key: "project", width: 18 },
+    { header: "行业", key: "industry", width: 16 },
+    { header: "模板", key: "template", width: 20 },
+    { header: "数量", key: "count", width: 10 },
+    { header: "提示词", key: "prompt", width: 60 },
+    { header: "尺寸", key: "size", width: 16 }
+  ];
+  worksheet.addRows([
+    {
+      project: "夏季上新",
+      industry: "电商零售",
+      template: "商品场景种草图",
+      count: 2,
+      prompt: "生成夏季新品种草图，突出清爽、轻量、高质感，留出标题区域。",
+      size: "1024x1536"
+    },
+    {
+      project: "短剧封面 A 组",
+      industry: "短剧影视",
+      template: "竖版短剧封面",
+      count: 1,
+      prompt: "雨夜街头，人物表情紧张，电影级布光，保留标题留白。",
+      size: "1024x1536"
+    }
+  ]);
+  const filePath = path.join(settings.saveDirectory, `云桥Pro-批量生产导入模板-${Date.now()}.xlsx`);
+  await workbook.xlsx.writeFile(filePath);
+  return { path: filePath };
+});
+
+ipcMain.handle("templates:export", async (_event, templates: unknown[]) => {
+  if (!mainWindow) throw new Error("主窗口未就绪");
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: "导出云桥Pro模板包",
+    defaultPath: `云桥Pro-模板包-${Date.now()}.json`,
+    filters: [{ name: "JSON 模板包", extensions: ["json"] }]
+  });
+  if (result.canceled || !result.filePath) return null;
+  await writeFile(result.filePath, JSON.stringify({ version: 1, templates }, null, 2), "utf-8");
+  return { path: result.filePath };
+});
+
+ipcMain.handle("templates:import", async () => {
+  if (!mainWindow) throw new Error("主窗口未就绪");
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ["openFile"],
+    title: "导入云桥Pro模板包",
+    filters: [{ name: "JSON 模板包", extensions: ["json"] }]
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  const parsed = JSON.parse(await readFile(result.filePaths[0], "utf-8")) as { templates?: unknown[] } | unknown[];
+  const templates = Array.isArray(parsed) ? parsed : Array.isArray(parsed.templates) ? parsed.templates : [];
+  return { path: result.filePaths[0], templates };
+});
+
 ipcMain.handle("assets:create-zip", async (_event, assets: Array<{ name: string; prompt: string; cloudUrl: string; localPath?: string }>) => {
   const settings = await readSettings();
   await mkdir(settings.saveDirectory, { recursive: true });
@@ -732,6 +927,29 @@ ipcMain.handle("assets:upload", async (_event, asset: { name: string; project?: 
     storageType: profile.type,
     objectKey: result.objectKey,
     url: result.url
+  };
+});
+
+ipcMain.handle("storage:test-upload", async (_event, profile: PersistedStorageProfile) => {
+  const settings = await readSettings();
+  await mkdir(settings.saveDirectory, { recursive: true });
+  const testFile = path.join(settings.saveDirectory, `云桥Pro-上传测试-${Date.now()}.png`);
+  const onePixelPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/ax2kQAAAABJRU5ErkJggg==", "base64");
+  await writeFile(testFile, onePixelPng);
+  const startedAt = Date.now();
+  const result = await uploadWithStorage(profile, {
+    name: "云桥Pro上传测试",
+    project: "系统测试",
+    source: "存储设置",
+    localPath: testFile
+  });
+  return {
+    ok: true,
+    storageName: profile.name,
+    storageType: profile.type,
+    objectKey: result.objectKey,
+    url: result.url,
+    durationMs: Date.now() - startedAt
   };
 });
 

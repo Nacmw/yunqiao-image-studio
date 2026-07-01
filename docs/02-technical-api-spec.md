@@ -5,7 +5,7 @@
 
 ## 1. 目标
 
-本规范用于把云桥Pro 从 PRD 变成可开发的桌面应用。所有 API 参数以 OpenAI GPT Image 官方文档为基准，并适配用户配置的兼容 OpenAI 图片接口服务地址。
+本规范用于把云桥Pro 从 PRD 变成可开发的桌面应用。所有 API 参数以 OpenAI GPT Image 官方文档为基准，客户端固定连接 `https://api.0029.org`。
 
 ## 2. 服务配置
 
@@ -19,7 +19,7 @@ export const IMAGE_API_CONFIG = {
 };
 ```
 
-应用设置页允许用户自定义 API Base URL。请求时会移除末尾 `/`，并只允许 `http` 或 `https`。
+应用固定 API Base URL 为 `https://api.0029.org`，设置页仅展示地址并提供 API Key 保存、超时时间和连通性测试。
 
 密钥来源:
 
@@ -41,7 +41,7 @@ Authorization: Bearer <api_key>
 端点:
 
 ```http
-POST {apiBaseUrl}/v1/images/generations
+POST https://api.0029.org/v1/images/generations
 Content-Type: application/json
 ```
 
@@ -104,7 +104,7 @@ Content-Type: application/json
 端点:
 
 ```http
-POST {apiBaseUrl}/v1/images/edits
+POST https://api.0029.org/v1/images/edits
 ```
 
 推荐使用 multipart/form-data 发送本地文件:

@@ -511,6 +511,13 @@ label {
   font-size: 12px;
 }
 
+.maskToolRow {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 13px;
+}
+
 .toolShelf {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1340,7 +1347,7 @@ label {
 
 .batchSummary {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
   margin: 12px 0;
 }
@@ -1491,6 +1498,7 @@ label {
   place-items: center;
   width: 40px;
   height: 40px;
+  padding: 0;
   overflow: hidden;
   background: #101826;
   border: 1px solid #30415e;
@@ -1512,6 +1520,52 @@ label {
   background: #101826;
   border: 1px dashed #34425d;
   border-radius: 8px;
+}
+
+.assetFilters {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 180px 130px auto;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.assetFilters span {
+  color: #8da0bc;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.diagnosticBox {
+  display: grid;
+  gap: 7px;
+  margin: 12px 0;
+  padding: 10px 12px;
+  background: #101a2a;
+  border: 1px solid #293853;
+  border-radius: 8px;
+}
+
+.diagnosticBox.success {
+  border-color: #147c5b;
+}
+
+.diagnosticBox.warning {
+  border-color: #a85a16;
+}
+
+.diagnosticBox strong {
+  font-size: 13px;
+}
+
+.diagnosticBox span,
+.diagnosticBox code {
+  min-width: 0;
+  overflow: hidden;
+  color: #9fb0c8;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .storageList {
@@ -1651,6 +1705,11 @@ label {
   max-height: 92vh;
 }
 
+.maskEditorPanel {
+  width: min(1080px, 96vw);
+  max-height: 92vh;
+}
+
 .modalHeader {
   display: flex;
   align-items: center;
@@ -1705,6 +1764,44 @@ label {
   object-fit: contain;
 }
 
+.maskToolbar {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+
+.maskToolbar label {
+  min-width: 260px;
+  margin-bottom: 0;
+}
+
+.maskCanvasWrap {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 420px;
+  overflow: auto;
+  background: #0b111d;
+  border: 1px solid #2a3852;
+  border-radius: 10px;
+}
+
+.maskCanvasWrap img,
+.maskCanvasWrap canvas {
+  grid-area: 1 / 1;
+  display: block;
+  max-width: 100%;
+  max-height: 68vh;
+}
+
+.maskCanvasWrap canvas {
+  touch-action: none;
+  opacity: 0.48;
+  cursor: crosshair;
+}
+
 .templateEditorGrid {
   margin-bottom: 12px;
 }
@@ -1747,5 +1844,9 @@ label {
 
   .storageTypeGrid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .assetFilters {
+    grid-template-columns: 1fr;
   }
 }
